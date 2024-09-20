@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Resources:
+
+  MyKinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: KinesisStreamDemo
+      RetentionPeriodHours: 24
+      ShardCount: 2
+      StreamModeDetails:
+        StreamMode: "PROVISIONED"
+
+  FirehoseBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub 'firehose-delivery-bucket'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: 'prefix'
+                    Value: 'data/'
+            Function: "input here"
+
+  FirehoseRole:
+    Type: 'AWS::IAM::Role'
+    DependsOn: FirehoseBucket
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: "firehose.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: FirehosePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource: 
+                  - !GetAtt FirehoseBucket.Arn
+                  - !Sub '${FirehoseBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator
+                  - kinesis:GetRecords
+                Resource: 
+                  - !GetAtt MyKinesisStream.Arn
+
+  FirehoseDeliveryStream:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    DependsOn: FirehoseBucket
+    Properties:
+      DeliveryStreamType: 'KinesisStreamAsSource'
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt MyKinesisStream.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt FirehoseBucket.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: 'data/'
+        ErrorOutputPrefix: 'errors/'
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+        CompressionFormat: 'UNCOMPRESSED'
+        EncryptionConfiguration:
+          NoEncryptionConfig: 'NoEncryption'
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    DependsOn: FirehoseBucket
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'LambdaS3AccessPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub '${FirehoseBucket.Arn}'
+                  - !Sub '${FirehoseBucket.Arn}/*'
+              - Effect: 'Allow'
+                Action:
+                  - 'rds-db:connect'
+                Resource: '*'
+              - Effect: 'Allow'
+                Action:
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DeleteNetworkInterface'
+                  - 'ec2:DescribeSecurityGroups'
+                  - 'ec2:DescribeSubnets'
+                  - 'ec2:DescribeVpcs'
+                Resource: '*'
+
+  LambdaSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !ImportValue DemoVPCId
+      GroupDescription: Security group for Lambda function
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !ImportValue DemoSecurityGroupId
+      Tags:
+        - Key: Name
+          Value: LambdaSecurityGroup
+
+  FireHoseProcessingLambda:
+    Type: 'AWS::Lambda::Function'
+    DependsOn: 
+      - LambdaExecutionRole
+    Properties:
+      Handler: 'index.handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def handler(event, context):
+              print("Event: ", json.dumps(event))
+      Runtime: 'python3.9'
+      Timeout: 300
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue DemoPrivateSubnet1Id
+          - !ImportValue DemoPrivateSubnet2Id
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    DependsOn:
+      - FireHoseProcessingLambda
+      - FirehoseBucket
+    Properties:
+      FunctionName: !Ref FireHoseProcessingLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: 's3.amazonaws.com'
+      SourceArn: !GetAtt FirehoseBucket.Arn
+
+  S3VpcEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcId: !ImportValue DemoVPCId
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !ImportValue DemoPublicRouteTableId
+        - !ImportValue DemoPrivateRouteTableId
+
+Outputs:
+  KinesisStreamName:
+    Value: !Ref MyKinesisStream
+  KinesisStreamARN:
+    Value: !GetAtt MyKinesisStream.Arn
+  FirehoseStreamName:
+    Description: 'The name of the Firehose Delivery Stream'
+    Value: !Ref FirehoseDeliveryStream
+  FirehoseBucketName:
+    Description: 'The name of the S3 bucket for Firehose delivery'
+    Value: !Ref FirehoseBucket
+  FirehoseRoleArn:
+    Description: 'The ARN of the IAM Role for Firehose Delivery Stream'
+    Value: !GetAtt FirehoseRole.Arn
+  LambdaFunctionArn:
+    Description: 'The ARN of the Lambda Function'
+    Value: !GetAtt FireHoseProcessingLambda.Arn

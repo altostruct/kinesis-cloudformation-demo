@@ -1,0 +1,15 @@
+Environments:
+  - name:  example-name
+    profile: example-profile
+    region:  example-region
+    artifacts: example-artifact
+
+Stacks:
+  - path: ./services/VPC.yml
+    name: DemoVPC
+
+  - path: ./services/RDS.yml
+    name: DemoRDS
+
+  - path: ./services/Kinesis.yml
+    name: KinesisStreamDemo

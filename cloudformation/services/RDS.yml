@@ -1,0 +1,170 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Basic RDS MySQL instance with Proxy for Demo
+Parameters:
+  DBName:
+    Type: String
+    Default: DemoDB
+
+  DBUser:
+    Type: String
+    Default: admin
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Default: password
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+
+  KeyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Default: my-bastion-key
+
+Resources:
+  MyDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS instance
+      SubnetIds:
+      - Fn::ImportValue: DemoPrivateSubnet1Id
+      - Fn::ImportValue: DemoPrivateSubnet2Id
+      
+  MyDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName:
+        Ref: DBName
+      MasterUsername:
+        Ref: DBUser
+      MasterUserPassword:
+        Ref: DBPassword
+      DBInstanceClass:
+        Ref: DBInstanceClass
+      AllocatedStorage:
+        Ref: DBAllocatedStorage
+      Engine: mysql
+      VPCSecurityGroups:
+      - Fn::ImportValue: DemoSecurityGroupId
+      DBSubnetGroupName:
+        Ref: MyDBSubnetGroup
+      MultiAZ: false
+      PubliclyAccessible: false
+      StorageType: gp2
+      BackupRetentionPeriod: 7
+  
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: DemoDBSecret
+      Description: RDS credentials for demo
+      SecretString:
+        Fn::Sub: "{\n  \"username\": \"${DBUser}\",\n  \"password\": \"${DBPassword}\"\
+          ,\n  \"engine\": \"mysql\",\n  \"host\": \"\",\n  \"dbname\": \"${DBName}\"\
+          \n}\n"
+  
+  RDSProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: rds.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: RDSProxyAccessPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - secretsmanager:GetSecretValue
+            - secretsmanager:DescribeSecret
+            - secretsmanager:ListSecretVersionIds
+            - rds-db:connect
+            Resource: '*'
+  
+  RDSProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: DemoProxy
+      EngineFamily: MYSQL
+      RequireTLS: false
+      RoleArn:
+        Fn::GetAtt:
+        - RDSProxyRole
+        - Arn
+      VpcSubnetIds:
+      - Fn::ImportValue: DemoPrivateSubnet1Id
+      - Fn::ImportValue: DemoPrivateSubnet2Id
+      VpcSecurityGroupIds:
+      - Fn::ImportValue: DemoSecurityGroupId
+      Auth:
+      - AuthScheme: SECRETS
+        IAMAuth: DISABLED
+        SecretArn:
+          Ref: DBSecret
+      IdleClientTimeout: 1800
+      DebugLogging: false
+  
+  RDSProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName:
+        Ref: RDSProxy
+      TargetGroupName: default
+      DBInstanceIdentifiers:
+      - Ref: MyDBInstance
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 100
+        MaxIdleConnectionsPercent: 50
+        ConnectionBorrowTimeout: 120
+        SessionPinningFilters: []
+  
+  BastionHost:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: t2.micro
+      KeyName: !Ref KeyName
+      ImageId: ami-0de02246788e4a354
+      SubnetId: !ImportValue DemoPublicSubnetId
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+
+  BastionSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security group for bastion host
+      VpcId: !ImportValue DemoVPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+Outputs:
+  DBInstanceEndpoint:
+    Value:
+      Fn::GetAtt:
+      - MyDBInstance
+      - Endpoint.Address
+    Description: The connection endpoint for the RDS instance
+  DBInstanceIdentifier:
+    Value:
+      Ref: MyDBInstance
+    Description: The RDS instance identifier
+  RDSProxyEndpoint:
+    Value:
+      Fn::GetAtt:
+      - RDSProxy
+      - Endpoint
+    Description: The connection endpoint for the RDS Proxy
